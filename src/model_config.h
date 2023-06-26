@@ -60,6 +60,8 @@ typedef char                          Boolean;
 #include "error.h"
 #include "generated/model_config.generated.h"
 
+EmbeddedControllerType EmbeddedControllerType_FromString(const char*);
+const char*            EmbeddedControllerType_ToString(EmbeddedControllerType);
 Error* ModelConfig_Validate(ModelConfig*);
 Error* ModelConfig_FromFile(ModelConfig*, const char*);
 void   ModelConfig_Free(ModelConfig*);

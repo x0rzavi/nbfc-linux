@@ -6,6 +6,7 @@
 #include "sleep.h"
 #include "ec_linux.h"
 #include "ec_sys_linux.h"
+#include "model_config.h"
 #include "optparse/optparse.h"
 #include "generated/ec_probe.help.h"
 
@@ -17,11 +18,13 @@
 #include <unistd.h>
 
 #include "error.c"             // src
+#include "ec.c"                // src
 #include "ec_linux.c"          // src
 #include "ec_sys_linux.c"      // src
 #include "optparse/optparse.c" // src
 #include "memory.c"            // src
 #include "nxjson.c"            // src
+#include "model_config.c"      // src
 
 #define Console_Black         "\033[0;30m"
 #define Console_Red           "\033[0;31m"
@@ -114,45 +117,40 @@ static const cli99_option monitor_command_options[] = {
   {"-r|--report",              -'r',  1},
   {"-c|--clearly",             -'c',  0},
   {"-d|--decimal",             -'d',  0},
-  {"-t|--timespan",            -'t',  1|cli99_type(unsigned)},
-  {"-i|--interval",            -'i',  1|cli99_type(unsigned)},
+  {"-t|--timespan",            -'t',  1},
+  {"-i|--interval",            -'i',  1},
   cli99_options_end()
 };
 
 static const cli99_option watch_command_options[] = {
   cli99_include_options(&main_options),
-  {"-t|--timespan",            -'t',  1|cli99_type(unsigned)},
-  {"-i|--interval",            -'i',  1|cli99_type(unsigned)},
+  {"-t|--timespan",            -'t',  1},
+  {"-i|--interval",            -'i',  1},
   cli99_options_end()
 };
 
 static const cli99_option read_command_options[] = {
   cli99_include_options(&main_options),
-  {"register",                  'R',  1|cli99_type(uint8_t)|cli99_required_option},
+  {"register",                  'R',  1|cli99_required_option},
   {"-w|--word",                -'w',  0},
   cli99_options_end()
 };
 
 static const cli99_option write_command_options[] = {
   cli99_include_options(&main_options),
-  {"register",                  'R',  1|cli99_type(uint8_t)|cli99_required_option},
-  {"value",                     'V',  1|cli99_type(uint16_t)|cli99_required_option},
+  {"register",                  'R',  1|cli99_required_option},
+  {"value",                     'V',  1|cli99_required_option},
   {"-w|--word",                -'w',  0},
   cli99_options_end()
 };
 
-static const cli99_option dump_command_options[] = {
-  cli99_include_options(&main_options),
-  cli99_options_end()
-};
-
 static const cli99_option* Options[] = {
-  dump_command_options,
+  main_options, // dump
   monitor_command_options,
   watch_command_options,
   read_command_options,
   write_command_options,
-  dump_command_options, // help
+  main_options, // help
 };
 
 static struct {
@@ -168,34 +166,23 @@ static struct {
   int             stress_cpu;
 } options = {0};
 
-static bool TestEC(EC_VTable* ec) {
-  Error* e = ec->Open();
-  if (e)
-    return false;
+static int64_t parse_number(const char* s, int64_t min, int64_t max, char** errmsg) {
+  errno = 0;
+  char* end;
+  int64_t val = strtoll(s, &end, 0);
 
-  uint8_t byte;
-  e = ec->ReadByte(0, &byte);
-  ec->Close();
-  return !e;
-}
+  if (errno)
+    *errmsg = strerror(errno);
+  else if (!*s || *end)
+    *errmsg = strerror(EINVAL);
+  else if (val < min)
+    *errmsg = "value too small";
+  else if (val > max)
+    *errmsg = "value too large";
+  else
+    *errmsg = NULL;
 
-static Error* FindEC() {
-  if (TestEC(&EC_SysLinux_VTable)) {
-    ec = &EC_SysLinux_VTable;
-    return err_success();
-  }
-
-  if (TestEC(&EC_SysLinux_ACPI_VTable)) {
-    ec = &EC_SysLinux_ACPI_VTable;
-    return err_success();
-  }
-
-  if (TestEC(&EC_Linux_VTable)) {
-    ec = &EC_Linux_VTable;
-    return err_success();
-  }
-
-  return err_string(0, "No working implementation found for reading the embedded controller");
+  return val;
 }
 
 int main(int argc, char* const argv[]) {
@@ -207,6 +194,7 @@ int main(int argc, char* const argv[]) {
   cli99_Init(&p, argc, argv, main_options, cli99_options_python);
 
   int o;
+  char* err;
   while ((o = cli99_GetOpt(&p))) {
     switch (o) {
     case  'C':
@@ -221,24 +209,37 @@ int main(int argc, char* const argv[]) {
       }
       cli99_SetOptions(&p, Options[cmd], false);
       break;
-    case  'R':  options.register_= p.optval.u;           break;
-    case  'V':  options.value    = p.optval.u;           break;
+    case  'R':  options.register_ = parse_number(p.optarg, 0, 255, &err);
+                if (err)
+                  die(NBFC_EXIT_CMDLINE, "%s: register: %s\n", argv[0], err);
+                break;
+    case  'V':  options.value = parse_number(p.optarg, 0, 65535, &err);
+                if (err)
+                  die(NBFC_EXIT_CMDLINE, "%s: value: %s\n", argv[0], err);
+                break;
     case -'h':  printf(HelpTexts[cmd], argv[0]);         return 0;
     case -'V':  printf("ec_probe " NBFC_VERSION "\n");   return 0;
     case -'c':  options.clearly  = 1;                    break;
     case -'d':  options.decimal  = 1;                    break;
     case -'v':  options.verbose  = 1;                    break;
     case -'w':  options.use_word = 1;                    break;
-    case -'e':  if (!strcmp("ec_sys_linux", p.optarg))   ec = &EC_SysLinux_VTable;
-                else if (!strcmp("ec_acpi", p.optarg))   ec = &EC_SysLinux_ACPI_VTable;
-                else if (!strcmp("ec_linux", p.optarg))  ec = &EC_Linux_VTable;
-                else die(NBFC_EXIT_CMDLINE, "Invalid value: %s\n", p.optarg);
+    case -'e':  switch(EmbeddedControllerType_FromString(p.optarg)) {
+                  case EmbeddedControllerType_ECSysLinux:     ec = &EC_SysLinux_VTable; break;
+                  case EmbeddedControllerType_ECSysLinuxACPI: ec = &EC_SysLinux_ACPI_VTable; break;
+                  case EmbeddedControllerType_ECLinux:        ec = &EC_Linux_VTable; break;
+                  default: die(NBFC_EXIT_CMDLINE, "%s: -e|--embedded-controller: Invalid value: %s\n", argv[0], p.optarg);
+                }
                 break;
     case -'r':  options.report   = p.optarg;             break;
-    case -'t':  options.timespan = p.optval.i * 1000;    break;
-    case -'i':  options.interval = p.optval.i * 1000;
-                if (! options.interval)
-                  die(NBFC_EXIT_CMDLINE, "%s: %s\n", argv[0], "--interval == 0");
+    case -'t':  options.timespan = parse_number(p.optarg, 1, INT64_MAX, &err);
+                options.timespan *= 1000;
+                if (err)
+                  die(NBFC_EXIT_CMDLINE, "%s: -t|--timespan: %s\n", argv[0], err);
+                break;
+    case -'i':  options.interval = parse_number(p.optarg, 1, INT64_MAX, &err);
+                options.interval *= 1000;
+                if (err)
+                  die(NBFC_EXIT_CMDLINE, "%s: -i|--interval: %s\n", argv[0], err);
                 break;
     default:
       cli99_ExplainError(&p);
@@ -259,12 +260,16 @@ int main(int argc, char* const argv[]) {
     exit(NBFC_EXIT_CMDLINE);
   }
 
+  if (geteuid()) {
+    die(NBFC_EXIT_FAILURE, "This program must be run as root\n");
+  }
+
   Error* e = NULL;
   signal(SIGINT,  Handle_Signal);
   signal(SIGTERM, Handle_Signal);
 
   if (ec == NULL) {
-    e = FindEC();
+    e = EC_FindWorking(&ec);
     e_die();
   }
 
